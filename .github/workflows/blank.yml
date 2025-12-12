@@ -1,0 +1,649 @@
+name: Deploy Lambda Functions - CI
+
+permissions:
+  id-token: write
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Enable dry-run mode"
+        type: boolean
+        default: false
+      environment:
+        description: "Environment for dry-run"
+        type: choice
+        required: false
+        options:
+          - development
+          - staging
+          - production
+
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+    branches:
+       - "develop/*"
+       - "release/*"
+    paths:
+      - functions/**
+      - api-docs/**
+      - kong/**
+  pull_request:
+    branches:
+      - "develop/*"
+      - "release/*"
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened 
+    paths:
+      - functions/**
+      - api-docs/**
+      - kong/**
+
+env:
+  PAT_SECRET_ID: arn:aws:secretsmanager:ap-northeast-1:149653749155:secret:PIPELINE-M4vrAD
+  PAT_SECRET_NAMES: "AZDO-PAT,GITHUB-PAT"
+  IS_DEV: ${{ (inputs.dry-run && inputs.environment == 'development') ||(!inputs.dry-run && ((github.event_name == 'pull_request' && startsWith(github.base_ref, 'develop')) ||(github.event_name == 'push' && github.ref_type == 'branch' && startsWith(github.ref_name, 'develop')))) }}
+  IS_STAGING: ${{ (inputs.dry-run && inputs.environment == 'staging') || (!inputs.dry-run && ((github.event_name == 'pull_request' && startsWith(github.base_ref, 'release')) || (github.event_name == 'push' && github.ref_type == 'branch' && startsWith(github.ref_name, 'release')))) }}
+  IS_PROD: ${{ (inputs.dry-run && inputs.environment == 'production') || (!inputs.dry-run && ((github.event_name == 'pull_request' && github.base_ref == 'main') || (github.ref_type == 'tag' && !contains(github.ref_name, '-rc') && !contains(github.ref_name, '-qa')))) }}
+  envFile: ./.env
+  OPENAPI_FILEPATH: _docs/_openapi.json
+
+jobs:
+  detect-environment:
+    name: Detect Environment
+    runs-on: ["cloud", "infra"]
+    outputs:
+      environment: ${{ steps.env.outputs.environment }}
+      docker_tag: ${{ steps.env.outputs.docker_tag }}
+      is_prod: ${{ steps.env.outputs.is_prod }}
+      kong_control_plane: ${{ steps.env.outputs.kong_control_plane }}
+      kong_environment: ${{ steps.env.outputs.kong_environment }}
+      pat_secret_id: ${{ steps.env.outputs.pat_secret_id }}
+      pat_secret_names: ${{ steps.env.outputs.pat_secret_names }}
+
+    steps:
+      - name: Determine Environment
+        id: env
+        run: |
+          IS_DEV: ${{ (inputs.dry-run && inputs.environment == 'development') ||(!inputs.dry-run && ((github.event_name == 'pull_request' && startsWith(github.base_ref, 'develop')) ||(github.event_name == 'push' && github.ref_type == 'branch' && startsWith(github.ref_name, 'develop')))) }}
+          IS_STAGING: ${{ (inputs.dry-run && inputs.environment == 'staging') || (!inputs.dry-run && ((github.event_name == 'pull_request' && startsWith(github.base_ref, 'release')) || (github.event_name == 'push' && github.ref_type == 'branch' && startsWith(github.ref_name, 'release')))) }}
+          IS_PROD: ${{ (inputs.dry-run && inputs.environment == 'production') || (!inputs.dry-run && ((github.event_name == 'pull_request' && github.base_ref == 'main') || (github.ref_type == 'tag' && !contains(github.ref_name, '-rc') && !contains(github.ref_name, '-qa')))) }}
+
+          if [ "$IS_DEV" == "true" ]; then
+            echo "environment=development" >> $GITHUB_OUTPUT
+            echo "docker_tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+            echo "is_prod=false" >> $GITHUB_OUTPUT
+            echo "kong_control_plane=${{ vars.CI_KONG_CONTROL_PLANE_NAME }}-Dev" >> $GITHUB_OUTPUT
+            echo "kong_environment=Dev" >> $GITHUB_OUTPUT
+          elif [ "$IS_STAGING" == "true" ]; then
+            echo "environment=staging" >> $GITHUB_OUTPUT
+            echo "docker_tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            echo "is_prod=false" >> $GITHUB_OUTPUT
+            echo "kong_control_plane=${{ vars.CI_KONG_CONTROL_PLANE_NAME }}-Stg" >> $GITHUB_OUTPUT
+            echo "kong_environment=Stg" >> $GITHUB_OUTPUT
+          elif [ "$IS_PROD" == "true" ]; then
+            echo "environment=production" >> $GITHUB_OUTPUT
+            echo "docker_tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            echo "is_prod=true" >> $GITHUB_OUTPUT
+            echo "kong_control_plane=${{ vars.CI_KONG_CONTROL_PLANE_NAME }}-prod" >> $GITHUB_OUTPUT
+            echo "kong_environment=prod" >> $GITHUB_OUTPUT
+          else
+            echo "::error::Unable to determine environment"
+            exit 1
+          fi
+
+          # Pass-through env variables to other jobs.
+          echo "pat_secret_id=${{ env.PAT_SECRET_ID }}" >> $GITHUB_OUTPUT
+          echo "pat_secret_names=${{ env.PAT_SECRET_NAMES }}" >> $GITHUB_OUTPUT
+
+          echo "::group::Environment Configuration"
+          cat $GITHUB_OUTPUT
+          echo "::endgroup::"
+
+  detect-changes:
+    name: Detect Changed Functions
+    runs-on: ["cloud", "infra"]
+    outputs:
+      directories: ${{ steps.set-directories.outputs.directories }}
+      changed-kong-related-files: ${{ steps.changed-kong-related-files.outputs.any_changed }}
+      has-functions: ${{ steps.set-directories.outputs.has_functions }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # - name: Parse tag for function name
+      #   id: parse-tag
+      #   if: github.ref_type == 'tag'
+      #   run: |
+      #     TAG_NAME="${{ github.ref_name }}"
+      #     echo "Tag: $TAG_NAME"
+
+      #     # New format: v1.2.3-rc-function-name or v1.2.3-function-name
+      #     # Parse tag using jq
+      #     FUNCTION_NAME=$(jq -n --arg tag "$TAG_NAME" '
+      #       $tag
+      #       | gsub("^v[0-9]+\\.[0-9]+\\.[0-9]+-?"; "")
+      #       | split("-")
+      #       | if length == 0 or . == [""] then
+      #           null
+      #         elif .[0] | test("^(rc|qa)[0-9]*$") then
+      #           if length > 1 then (.[1:] | join("-")) else null end
+      #         else
+      #           . | join("-")
+      #         end
+      #     ' -r)
+
+      #     if [ -n "$FUNCTION_NAME" ] && [ "$FUNCTION_NAME" != "null" ]; then
+      #       # Verify the function directory actually exists
+      #       if [ -d "functions/$FUNCTION_NAME" ]; then
+      #         echo "function_name=$FUNCTION_NAME" >> $GITHUB_OUTPUT
+      #         echo "::notice::Detected function from tag: $FUNCTION_NAME"
+      #       else
+      #         echo "::error::Function directory 'functions/$FUNCTION_NAME' does not exist"
+      #         exit 1
+      #       fi
+      #     else
+      #       echo "::notice::No function name in tag - will deploy all functions"
+      #     fi
+
+      - name: Get changed function directories
+        id: changed-dirs
+        if: (github.ref_type == 'branch' && (startsWith(github.ref_name, 'develop') || startsWith(github.ref_name, 'release'))) || github.ref_type == 'tag' || github.event_name == 'pull_request'
+        uses: tj-actions/changed-files@v44
+        with:
+          matrix: true
+          dir_names: true
+          dir_names_max_depth: 2
+          dir_names_exclude_current_dir: true
+          files: |
+            functions/**
+
+      # - name: Set directories output
+      #   id: set-directories
+      #   run: |
+      #     if [ "${{ github.ref_type }}" == "tag" ]; then
+      #       FUNCTION_NAME="${{ steps.parse-tag.outputs.function_name }}"
+            
+      #       if [ -n "$FUNCTION_NAME" ]; then
+      #         echo "::notice::Tag deployment - deploying only: $FUNCTION_NAME"
+      #         DIRS='["functions/'"$FUNCTION_NAME"'"]'
+      #         echo "has_functions=true" >> $GITHUB_OUTPUT
+      #       else
+      #         echo "::notice::Tag deployment - deploying all functions"
+      #         DIRS=$(find functions/* -maxdepth 0 -type d -exec basename {} \; | jq -R -s -c 'split("\n")[:-1] | map("functions/" + .)')
+      #         if [ "$DIRS" == "[]" ]; then
+      #           DIRS='[".skip"]'
+      #           echo "has_functions=false" >> $GITHUB_OUTPUT
+      #         else
+      #           echo "has_functions=true" >> $GITHUB_OUTPUT
+      #         fi
+      #       fi
+      #     elif [ "${{ github.ref_name }}" == "develop" ] || [ "${{ github.ref_name }}" == "release" ] || [ "${{ github.event_name }}" == "pull_request" ]; then
+      #       echo "::notice::Main branch - deploying changed functions only"
+      #       CHANGED_DIRS='${{ steps.changed-dirs.outputs.all_changed_files }}'
+      #       if [ "$CHANGED_DIRS" == "[]" ] || [ -z "$CHANGED_DIRS" ]; then
+      #         DIRS='[".skip"]'
+      #         echo "has_functions=false" >> $GITHUB_OUTPUT 
+      #       else
+      #         DIRS="$CHANGED_DIRS"
+      #         echo "has_functions=true" >> $GITHUB_OUTPUT
+      #       fi
+      #     else
+      #       echo "::notice::Non-main branch - no deployment"
+      #       DIRS='[".skip"]'
+      #       echo "has_functions=false" >> $GITHUB_OUTPUT
+      #     fi
+
+      #     echo "directories=$DIRS" >> $GITHUB_OUTPUT
+
+      - name: Set directories output
+        id: set-directories
+        run: |
+          echo "::notice::Determining functions to deploy..."
+          
+          if [ "${{ github.ref_type }}" == "tag" ]; then
+            echo "::notice::Tag detected → PROD deployment (changed functions only)"
+
+            CHANGED_DIRS='${{ steps.changed-dirs.outputs.all_changed_files }}'
+
+            if [ "$CHANGED_DIRS" == "[]" ] || [ -z "$CHANGED_DIRS" ]; then
+              echo "::notice::No changed functions for PROD"
+              DIRS='[".skip"]'
+              echo "has_functions=false" >> $GITHUB_OUTPUT
+            else
+              DIRS="$CHANGED_DIRS"
+              echo "::notice::Changed functions for PROD: $DIRS"
+              echo "has_functions=true" >> $GITHUB_OUTPUT
+            fi
+
+          elif [[ "${{ github.ref_name }}" == develop* ]] || \
+               [[ "${{ github.ref_name }}" == release* ]] || \
+               [[ "${{ github.event_name }}" == 'pull_request' ]]; then
+
+            echo "::notice::Dev/Staging branch → deploying changed functions only"
+
+            CHANGED_DIRS='${{ steps.changed-dirs.outputs.all_changed_files }}'
+
+            if [ "$CHANGED_DIRS" == "[]" ] || [ -z "$CHANGED_DIRS" ]; then
+              echo "::notice::No changed functions in DEV/STG"
+              DIRS='[".skip"]'
+              echo "has_functions=false" >> $GITHUB_OUTPUT
+            else
+              DIRS="$CHANGED_DIRS"
+              echo "::notice::Changed functions in DEV/STG: $DIRS"
+              echo "has_functions=true" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "::notice::Other branch → no deployment"
+            DIRS='[".skip"]'
+            echo "has_functions=false" >> $GITHUB_OUTPUT
+          fi
+          echo "directories=$DIRS" >> $GITHUB_OUTPUT
+
+      - name: Get changed OpenAPI and Kong directories
+        id: changed-kong-related-files
+        if: (github.ref_type == 'branch' && (startsWith(github.ref_name, 'develop') || startsWith(github.ref_name, 'release'))) || github.ref_type == 'tag' || github.event_name == 'pull_request'
+        uses: tj-actions/changed-files@v44
+        with:
+          dir_names: true
+          dir_names_exclude_current_dir: true
+          files: |
+            api-docs/**
+            kong/**
+            
+  python-quality-checks:
+    name: Python Quality Checks (${{ matrix.directory }})
+    runs-on: ["cloud", "infra"]
+    needs: ["detect-environment", "detect-changes"]
+    if: needs.detect-changes.outputs.has-functions == 'true'
+    strategy:
+      matrix:
+        directory: ${{ fromJSON(needs.detect-changes.outputs.directories) }}
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Skip placeholder
+        if: matrix.directory == '.skip'
+        run: echo "No functions to test for this matrix item"
+
+      - name: Set up Python
+        if: matrix.directory != '.skip'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        if: matrix.directory != '.skip'
+        working-directory: ${{ matrix.directory }}
+        run: |
+          python -m pip install --upgrade pip
+            if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+    
+      - name: Run flake8
+        if: matrix.directory != '.skip'
+        working-directory: ${{ matrix.directory }}
+        run: flake8 .
+
+      - name: Run pylint
+        if: matrix.directory != '.skip'
+        working-directory: ${{ matrix.directory }}
+        run: python -m pylint .
+
+      - name: Run pytest
+        if: matrix.directory != '.skip'
+        working-directory: ${{ matrix.directory }}
+        run: python -m pytest -v
+
+      - name: Run license scan
+        if: matrix.directory != '.skip'
+        working-directory: ${{ matrix.directory }}
+        run: |
+          pip-licenses --format=json --with-urls --with-license-file > licenses.json
+
+      - name: Upload license report
+        if: matrix.directory != '.skip'
+        uses: actions/upload-artifact@v4
+        with:
+          name: licenses-${{ matrix.directory }}
+          path: ${{ matrix.directory }}/licenses.json
+         
+  build:
+    name: Build ${{ matrix.directory }}
+    runs-on: ["cloud", "infra"]
+    needs: [detect-environment, detect-changes, python-quality-checks]
+    environment: ${{ needs.detect-environment.outputs.environment }}
+    strategy:
+      matrix:
+        directory: ${{ fromJSON(needs.detect-changes.outputs.directories) }}
+      fail-fast: false
+      max-parallel: 3
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract function metadata
+        id: meta
+        if: matrix.directory != '.skip'
+        run: |
+          DIR="${{ matrix.directory }}"
+          FUNC_NAME=$(basename "$DIR")
+
+          echo "function_name=$FUNC_NAME" >> $GITHUB_OUTPUT
+
+          echo "::group::Function Metadata"
+          echo "Directory: $DIR"
+          echo "Function Name: $FUNC_NAME"
+          echo "::endgroup::"
+
+      - name: Install AWS CLI
+        if: matrix.directory != '.skip'
+        uses: unfor19/install-aws-cli-action@v1
+
+      - name: Configure AWS Credentials for ECR
+        if: matrix.directory != '.skip'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.CI_AWS_ASSUME_ROLE }}
+          aws-region: ${{ vars.CI_AWS_REGION }}
+
+      - name: ECR Login
+        if: matrix.directory != '.skip'
+        id: login-ecr
+        shell: bash
+        run: |
+          aws ecr get-login-password --region ${{ vars.CI_AWS_REGION  }} | docker login --username AWS --password-stdin ${{ vars.CI_AWS_ECR_REGISTRY }}
+
+      - name: Set up Docker Buildx
+        if: matrix.directory != '.skip'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract image metadata
+        if: matrix.directory != '.skip'
+        id: image-meta
+        run: |
+          DOCKER_TAG="${{ needs.detect-environment.outputs.docker_tag }}"
+          FUNC_NAME=$(echo "${{ steps.meta.outputs.function_name }}" | jq -Rr '"jaime2-" + (ascii_downcase | gsub("_"; "-"))')
+          ECR_REGISTRY="${{ vars.CI_AWS_ECR_REGISTRY }}"
+          ECR_REPO_NAMESPACE="${{ vars.CI_AWS_ECR_REPO_NAMESPACE }}"
+
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPO_NAMESPACE/$FUNC_NAME:$DOCKER_TAG"
+
+          echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+          echo "::group::Build Details"
+          echo "Function: $FUNC_NAME"
+          echo "Environment: ${{ needs.detect-environment.outputs.environment }}"
+          echo "Docker Tag: $DOCKER_TAG"
+          echo "Full Image URI: $IMAGE_URI"
+          echo "::endgroup::"
+
+      - name: Build and Push Docker Image
+        if: matrix.directory != '.skip'
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.directory }}
+          platforms: linux/amd64
+          provenance: false
+          sbom: false
+          push: ${{ inputs.dry-run != true && github.event_name != 'pull_request' }}
+          tags: ${{ steps.image-meta.outputs.image_uri }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            FUNCTION_NAME=${{ steps.meta.outputs.function_name }}
+
+      - name: Dry-run notice
+        if: inputs.dry-run == true
+        run: |
+          echo "::notice::DRY RUN - Would build and push: ${{ steps.image-meta.outputs.image_uri }}"
+
+  request-deployment-approval:
+    needs: ["detect-environment", "build"]
+    environment: ${{ needs.detect-environment.outputs.environment }}
+    runs-on: ["cloud", "infra"]
+    if: ${{ !failure() && !cancelled() && github.event_name != 'pull_request' && needs.detect-environment.outputs.is_prod == 'true' }}
+
+    outputs:
+      pipeline_name: ${{ steps.request_approval.outputs.pipeline_name }}
+      run_id: ${{ steps.request_approval.outputs.run_id }}
+      environment: ${{ steps.request_approval.outputs.environment }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v3
+        with:
+          role-to-assume: ${{ vars.CI_AWS_ASSUME_ROLE }}
+          aws-region: ${{ vars.CI_AWS_REGION }}
+
+      - name: Load Secret Values from AWS Secrets Manager
+        uses: jeraoss/actions/aws/load-secretsmanager-secret-values@aws/load-secretsmanager-secret-values/v1
+        with:
+          secret: ${{ env.PAT_SECRET_ID }}
+          secret-keys: ${{ env.PAT_SECRET_NAMES }}
+
+      - name: Request Deployment Approval
+        id: request_approval
+        env:
+          AZURE_DEVOPS_EXT_PAT: ${{ env.AZDO-PAT }}
+        uses: jeraoss/actions/azure/devops-approval-request@azure/devops-approval-request/v1
+        with:
+          project: ${{ vars.CI_AZURE_DEVOPS_PROJ }}
+          org: ${{ vars.CI_JERA_AZURE_DEVOPS_ORG_URL }}
+          branch: ${{ vars.CI_AZURE_DEVOPS_BRANCH }}
+          pipeline_name: ${{ vars.CI_AZURE_DEVOPS_APPROVAL_PIPELINE_NAME }}
+          environment: ${{ needs.detect-environment.outputs.environment }}
+
+  check-deployment-approval:
+    needs: ["detect-environment", "build", "request-deployment-approval"]
+    environment: ${{ needs.detect-environment.outputs.environment }}
+    runs-on: ["cloud", "infra"]
+    if: ${{ !failure() && !cancelled() && github.event_name != 'pull_request' && needs.detect-environment.outputs.is_prod == 'true' }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v3
+        with:
+          role-to-assume: ${{ vars.CI_AWS_ASSUME_ROLE }}
+          aws-region: ${{ vars.CI_AWS_REGION }}
+
+      - name: Load Secret Values from AWS Secrets Manager
+        uses: jeraoss/actions/aws/load-secretsmanager-secret-values@aws/load-secretsmanager-secret-values/v1
+        with:
+          secret: ${{ env.PAT_SECRET_ID }}
+          secret-keys: ${{ env.PAT_SECRET_NAMES }}
+
+      - name: Check Deployment Approval
+        uses: jeraoss/actions/azure/devops-approval-check@azure/devops-approval-check/v1
+        env:
+          AZURE_DEVOPS_EXT_PAT: ${{ env.AZDO-PAT }}
+        with:
+          project: ${{ vars.CI_AZURE_DEVOPS_PROJ }}
+          org: ${{ vars.CI_JERA_AZURE_DEVOPS_ORG_URL }}
+          branch: ${{ vars.CI_AZURE_DEVOPS_BRANCH }}
+          pipeline_name: ${{ needs.request-deployment-approval.outputs.pipeline_name }}
+          environment: ${{ needs.request-deployment-approval.outputs.environment }}
+          run_id: ${{ needs.request-deployment-approval.outputs.run_id }}
+
+  deploy:
+    name: Deploy ${{ matrix.directory }} to ${{ needs.detect-environment.outputs.environment }}
+    runs-on: ["cloud", "infra"]
+    needs:
+      [
+        "detect-environment",
+        "detect-changes",
+        "build",
+        "check-deployment-approval",
+        "python-quality-checks"
+      ]
+    if: ${{ !failure() && !cancelled() && github.event_name != 'pull_request' && ((needs.detect-environment.outputs.is_prod == 'true' && needs.check-deployment-approval.result == 'success') || (needs.detect-environment.outputs.is_prod == 'false')) }}
+    environment: ${{ needs.detect-environment.outputs.environment }}
+    strategy:
+      matrix:
+        directory: ${{ fromJSON(needs.detect-changes.outputs.directories) }}
+      fail-fast: false
+      max-parallel: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract function metadata
+        id: meta
+        if: matrix.directory != '.skip'
+        run: |
+          DIR="${{ matrix.directory }}"
+          FUNC_NAME=$(basename "$DIR")
+          IMAGE_NAME=$(echo "$FUNC_NAME" | jq -Rr '"jaime2-" + (ascii_downcase | gsub("_"; "-"))')
+
+          ENV="${{ needs.detect-environment.outputs.environment }}"
+          if [ "$ENV" == "development" ]; then
+            ENV_SUFFIX="Dev"
+          elif [ "$ENV" == "staging" ]; then
+            ENV_SUFFIX="Stg"
+          elif [ "$ENV" == "qa" ]; then
+            ENV_SUFFIX="Qa"
+          else
+            ENV_SUFFIX="Prod"
+          fi
+
+          FUNCTION_ARN="arn:aws:lambda:${{ vars.CI_AWS_REGION }}:${{ vars.CI_AWS_ACCOUNT_ID }}:function:JAIME_${ENV_SUFFIX}_$FUNC_NAME"
+
+          DOCKER_TAG="${{ needs.detect-environment.outputs.docker_tag }}"
+          ECR_REGISTRY="${{ vars.CI_AWS_ECR_REGISTRY }}"
+          ECR_REPO_NAMESPACE="${{ vars.CI_AWS_ECR_REPO_NAMESPACE }}"
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPO_NAMESPACE/$IMAGE_NAME:$DOCKER_TAG"
+
+          echo "function_arn=$FUNCTION_ARN" >> $GITHUB_OUTPUT
+          echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+          echo "::group::Metadata"
+          echo "function_arn: $FUNCTION_ARN"
+          echo "image_uri: $IMAGE_URI"
+          echo "::endgroup::"
+
+      - name: Install AWS CLI
+        uses: unfor19/install-aws-cli-action@v1
+
+      - name: Configure AWS Credentials for ECR
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.CI_AWS_ASSUME_ROLE }}
+          aws-region: ${{ vars.CI_AWS_REGION }}
+
+      - name: Deploy Lambda Function
+        if: matrix.directory != '.skip'
+        run: |
+          if [ "${{ inputs.dry-run }}" == "true" ]; then
+            echo "::notice::DRY RUN - Would deploy ${{ steps.meta.outputs.function_arn }} with ${{ steps.meta.outputs.image_uri }}"
+          else
+            echo "::notice::Updating Lambda function code..."
+            aws lambda update-function-code \
+              --function-name "${{ steps.meta.outputs.function_arn }}" \
+              --image-uri "${{ steps.meta.outputs.image_uri }}" \
+              --region "${{ vars.CI_AWS_REGION }}" \
+              --output json
+
+            echo "::notice::Waiting for update to complete..."
+            aws lambda wait function-updated \
+              --function-name "${{ steps.meta.outputs.function_arn }}" \
+              --region ${{ vars.CI_AWS_REGION }}
+
+            echo "::notice::✓ Successfully deployed ${{ steps.meta.outputs.function_arn }}"
+          fi
+
+      - name: Verify Deployment
+        if: inputs.dry-run != true && matrix.directory != '.skip'
+        run: |
+          CURRENT_IMAGE=$(aws lambda get-function \
+            --function-name "${{ steps.meta.outputs.function_arn }}" \
+            --region ${{ vars.CI_AWS_REGION }} \
+            --query 'Code.ImageUri' \
+            --output text)
+
+          DOCKER_TAG="${{ needs.detect-environment.outputs.docker_tag }}"
+
+          echo "::group::Verification"
+          echo "Lambda: ${{ steps.meta.outputs.function_arn }}"
+          echo "Current Image: $CURRENT_IMAGE"
+          echo "Expected Tag: $DOCKER_TAG"
+          echo "::endgroup::"
+
+          if [[ "$CURRENT_IMAGE" == *"$DOCKER_TAG"* ]]; then
+            echo "::notice::✓ Deployment verified"
+          else
+            echo "::error::Verification failed - image tag mismatch"
+            exit 1
+          fi
+
+      - name: Publish Lambda Version (Production Only)
+        if: needs.detect-environment.outputs.is_prod == 'true' && inputs.dry-run != true && matrix.directory != '.skip'
+        run: |
+          VERSION=$(aws lambda publish-version \
+            --function-name "${{ steps.meta.outputs.function_arn }}" \
+            --region ${{ vars.CI_AWS_REGION }} \
+            --description "Deployed ${{ needs.detect-environment.outputs.docker_tag }}" \
+            --query 'Version' \
+            --output text)
+
+          echo "::notice::Published version: $VERSION"
+
+  upload-openapi:
+    name: Upload OpenAPI to Artifacts
+    runs-on: ["cloud", "infra"]
+    needs: ["detect-environment", "detect-changes"]
+    if: github.event_name != 'pull_request' && needs.detect-changes.outputs.changed-kong-related-files == 'true'
+    environment: ${{ needs.detect-environment.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Convert OpenAPI to JSON
+        run: |
+          echo "::notice::Converting OpenAPI to JSON"
+          mkdir -p _docs
+          yq -o=json api-docs/_openapi.yaml > ${{ env.OPENAPI_FILEPATH }}
+          echo "::notice::OpenAPI converted to JSON"
+
+      - name: Upload OpenAPI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openapi-json
+          path: ${{ env.OPENAPI_FILEPATH }}
+
+  kong:
+    name: Kong
+    uses: ./.github/workflows/kong-deploy.yaml
+    needs: ["detect-environment", "detect-changes", "upload-openapi", "deploy"]
+    if: |
+      github.event_name != 'pull_request' && 
+      needs.detect-changes.outputs.changed-kong-related-files == 'true' &&
+      (needs.detect-changes.outputs.has-functions == 'false' || needs.deploy.result == 'success')
+    with:
+      CI_ENVIRONMENT: ${{ needs.detect-environment.outputs.environment }}
+      ENVIRONMENT: ${{ needs.detect-environment.outputs.kong_environment }}
+      KONG_TAG_ORGANIZATION: ${{ vars.CI_KONG_TAG_ORGANIZATION }}
+      KONG_TAG_PROJECT: ${{ vars.CI_KONG_TAG_PROJECT }}
+      KONG_CONTROL_PLANE_NAME: ${{ needs.detect-environment.outputs.kong_control_plane }}
+      KONG_GATEWAY_SERVICE_NAME: ${{ vars.CI_KONG_TAG_PROJECT }}
+      KONG_GATEWAY_SERVICE_UPSTREAM: ${{ vars.CI_KONG_GATEWAY_SERVICE_UPSTREAM }}
+      KONG_GATEWAY_SERVICE_UPSTREAM_PORT: ${{ vars.CI_KONG_GATEWAY_SERVICE_UPSTREAM_PORT }}
+      KONG_GATEWAY_SERVICE_UPSTREAM_PROTOCOL: ${{ vars.CI_KONG_GATEWAY_SERVICE_UPSTREAM_PROTOCOL }}
+      KONG_PORTAL_NAME: ${{ vars.CI_KONG_PORTAL_NAME }}
+      KONG_API_PRODUCT_NAME: ${{ vars.CI_KONG_API_PRODUCT_NAME }}
+      KONG_KONNECT_ADDR: ${{ vars.CI_KONG_KONNECT_ADDR }}
+      PAT_SECRET_ID: ${{ needs.detect-environment.outputs.pat_secret_id }}
+      PAT_SECRET_NAMES: ${{ needs.detect-environment.outputs.pat_secret_names }}
+
+      ### This is a reusable workflow so it will expect these variable to be set in Github Environment Variables ###############################################################################
+      # OIDC_AZURE_CLIENT_ID: ${{ vars.CI_OIDC_AZURE_CLIENT_ID }}
+      # OIDC_AZURE_ISSUER_TENANT_ID: ${{ vars.CI_OIDC_AZURE_ISSUER_TENANT_ID }}
+      #########################################################################################################################################################################################
