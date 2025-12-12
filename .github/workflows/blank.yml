@@ -56,7 +56,7 @@ env:
 jobs:
   detect-environment:
     name: Detect Environment
-    runs-on: ["cloud", "infra"]
+    runs-on: ubuntu-latest
     outputs:
       environment: ${{ steps.env.outputs.environment }}
       docker_tag: ${{ steps.env.outputs.docker_tag }}
@@ -107,7 +107,7 @@ jobs:
 
   detect-changes:
     name: Detect Changed Functions
-    runs-on: ["cloud", "infra"]
+    runs-on: ubuntu-latest
     outputs:
       directories: ${{ steps.set-directories.outputs.directories }}
       changed-kong-related-files: ${{ steps.changed-kong-related-files.outputs.any_changed }}
