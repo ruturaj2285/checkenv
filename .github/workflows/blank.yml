@@ -619,31 +619,31 @@ jobs:
           name: openapi-json
           path: ${{ env.OPENAPI_FILEPATH }}
 
-  kong:
-    name: Kong
-    uses: ./.github/workflows/kong-deploy.yaml
-    needs: ["detect-environment", "detect-changes", "upload-openapi", "deploy"]
-    if: |
-      github.event_name != 'pull_request' && 
-      needs.detect-changes.outputs.changed-kong-related-files == 'true' &&
-      (needs.detect-changes.outputs.has-functions == 'false' || needs.deploy.result == 'success')
-    with:
-      CI_ENVIRONMENT: ${{ needs.detect-environment.outputs.environment }}
-      ENVIRONMENT: ${{ needs.detect-environment.outputs.kong_environment }}
-      KONG_TAG_ORGANIZATION: ${{ vars.CI_KONG_TAG_ORGANIZATION }}
-      KONG_TAG_PROJECT: ${{ vars.CI_KONG_TAG_PROJECT }}
-      KONG_CONTROL_PLANE_NAME: ${{ needs.detect-environment.outputs.kong_control_plane }}
-      KONG_GATEWAY_SERVICE_NAME: ${{ vars.CI_KONG_TAG_PROJECT }}
-      KONG_GATEWAY_SERVICE_UPSTREAM: ${{ vars.CI_KONG_GATEWAY_SERVICE_UPSTREAM }}
-      KONG_GATEWAY_SERVICE_UPSTREAM_PORT: ${{ vars.CI_KONG_GATEWAY_SERVICE_UPSTREAM_PORT }}
-      KONG_GATEWAY_SERVICE_UPSTREAM_PROTOCOL: ${{ vars.CI_KONG_GATEWAY_SERVICE_UPSTREAM_PROTOCOL }}
-      KONG_PORTAL_NAME: ${{ vars.CI_KONG_PORTAL_NAME }}
-      KONG_API_PRODUCT_NAME: ${{ vars.CI_KONG_API_PRODUCT_NAME }}
-      KONG_KONNECT_ADDR: ${{ vars.CI_KONG_KONNECT_ADDR }}
-      PAT_SECRET_ID: ${{ needs.detect-environment.outputs.pat_secret_id }}
-      PAT_SECRET_NAMES: ${{ needs.detect-environment.outputs.pat_secret_names }}
+  # kong:
+  #   name: Kong
+  #   uses: ./.github/workflows/kong-deploy.yaml
+  #   needs: ["detect-environment", "detect-changes", "upload-openapi", "deploy"]
+  #   if: |
+  #     github.event_name != 'pull_request' && 
+  #     needs.detect-changes.outputs.changed-kong-related-files == 'true' &&
+  #     (needs.detect-changes.outputs.has-functions == 'false' || needs.deploy.result == 'success')
+  #   with:
+  #     CI_ENVIRONMENT: ${{ needs.detect-environment.outputs.environment }}
+  #     ENVIRONMENT: ${{ needs.detect-environment.outputs.kong_environment }}
+  #     KONG_TAG_ORGANIZATION: ${{ vars.CI_KONG_TAG_ORGANIZATION }}
+  #     KONG_TAG_PROJECT: ${{ vars.CI_KONG_TAG_PROJECT }}
+  #     KONG_CONTROL_PLANE_NAME: ${{ needs.detect-environment.outputs.kong_control_plane }}
+  #     KONG_GATEWAY_SERVICE_NAME: ${{ vars.CI_KONG_TAG_PROJECT }}
+  #     KONG_GATEWAY_SERVICE_UPSTREAM: ${{ vars.CI_KONG_GATEWAY_SERVICE_UPSTREAM }}
+  #     KONG_GATEWAY_SERVICE_UPSTREAM_PORT: ${{ vars.CI_KONG_GATEWAY_SERVICE_UPSTREAM_PORT }}
+  #     KONG_GATEWAY_SERVICE_UPSTREAM_PROTOCOL: ${{ vars.CI_KONG_GATEWAY_SERVICE_UPSTREAM_PROTOCOL }}
+  #     KONG_PORTAL_NAME: ${{ vars.CI_KONG_PORTAL_NAME }}
+  #     KONG_API_PRODUCT_NAME: ${{ vars.CI_KONG_API_PRODUCT_NAME }}
+  #     KONG_KONNECT_ADDR: ${{ vars.CI_KONG_KONNECT_ADDR }}
+  #     PAT_SECRET_ID: ${{ needs.detect-environment.outputs.pat_secret_id }}
+  #     PAT_SECRET_NAMES: ${{ needs.detect-environment.outputs.pat_secret_names }}
 
-      ### This is a reusable workflow so it will expect these variable to be set in Github Environment Variables ###############################################################################
-      # OIDC_AZURE_CLIENT_ID: ${{ vars.CI_OIDC_AZURE_CLIENT_ID }}
-      # OIDC_AZURE_ISSUER_TENANT_ID: ${{ vars.CI_OIDC_AZURE_ISSUER_TENANT_ID }}
-      #########################################################################################################################################################################################
+  #     ### This is a reusable workflow so it will expect these variable to be set in Github Environment Variables ###############################################################################
+  #     # OIDC_AZURE_CLIENT_ID: ${{ vars.CI_OIDC_AZURE_CLIENT_ID }}
+  #     # OIDC_AZURE_ISSUER_TENANT_ID: ${{ vars.CI_OIDC_AZURE_ISSUER_TENANT_ID }}
+  #     #########################################################################################################################################################################################
