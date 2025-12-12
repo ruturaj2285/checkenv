@@ -70,10 +70,9 @@ jobs:
       - name: Determine Environment
         id: env
         run: |
-          IS_DEV=${{ (inputs.dry-run && inputs.environment == 'development') ||(!inputs.dry-run && ((github.event_name == 'pull_request' && startsWith(github.base_ref, 'develop')) ||(github.event_name == 'push' && github.ref_type == 'branch' && startsWith(github.ref_name, 'develop')))) }}
-          IS_STAGING=${{ (inputs.dry-run && inputs.environment == 'staging') || (!inputs.dry-run && ((github.event_name == 'pull_request' && startsWith(github.base_ref, 'release')) || (github.event_name == 'push' && github.ref_type == 'branch' && startsWith(github.ref_name, 'release')))) }}
-          IS_PROD=${{ (inputs.dry-run && inputs.environment == 'production') || (!inputs.dry-run && ((github.event_name == 'pull_request' && github.base_ref == 'main') || (github.ref_type == 'tag' && !contains(github.ref_name, '-rc') && !contains(github.ref_name, '-qa')))) }}
-
+          IS_DEV="${{ env.IS_DEV }}"
+          IS_STAGING="${{ env.IS_STAGING }}"
+          IS_PROD="${{ env.IS_PROD }}"
           if [ "$IS_DEV" == "true" ]; then
             echo "environment=development" >> $GITHUB_OUTPUT
             echo "docker_tag=${{ github.sha }}" >> $GITHUB_OUTPUT
